@@ -3,7 +3,7 @@ from pathlib import Path
 from pydantic import BaseModel, ValidationError, conint, constr
 from datetime import timedelta
 import srt
-from ollama import Ollama
+import ollama
 
 # ---------- Pydantic модели для строгой валидации ----------
 class SubtitleLine(BaseModel):
@@ -70,35 +70,81 @@ def validate_json(json_blocks: list[dict]) -> list[dict]:
 def process_srt(input_srt: Path, output_srt: Path):
     # 1. SRT -> JSON
     json_blocks = srt_to_json(input_srt)
+    total_blocks = len(json_blocks)
+    print(f"Всего блоков для обработки: {total_blocks}")
 
-    # 2. Валидация JSON
-    json_blocks = validate_json(json_blocks)
+    BATCH_SIZE = 10
+    all_edited_blocks = []
 
-    # 3. Подготовка запроса для модели Ollama
-    ollama = Ollama()
-    prompt = {
-        "role": "user",
-        "content": json.dumps(json_blocks, ensure_ascii=False)
-    }
+    # 3. Обработка батчами
+    for i in range(0, total_blocks, BATCH_SIZE):
+        batch = json_blocks[i : i + BATCH_SIZE]
+        print(f"Обработка батча {i // BATCH_SIZE + 1} из {(total_blocks + BATCH_SIZE - 1) // BATCH_SIZE} (блоки {i+1}-{min(i+BATCH_SIZE, total_blocks)})...")
 
-    # 4. Вызов локальной модели
-    response = ollama.chat(
-        model="Gemma3-srt-voice-over-editor:4b",
-        messages=[prompt],
-        temperature=0.7
-    )
+        prompt = {
+            "role": "user",
+            "content": json.dumps(batch, ensure_ascii=False)
+        }
 
-    # 5. Получение JSON из ответа модели
-    try:
-        edited_json = json.loads(response["content"])
-    except Exception as e:
-        raise RuntimeError(f"Ошибка разбора JSON из модели: {e}")
+        try:
+            # 4. Вызов локальной модели
+            response = ollama.chat(
+                model="gemma3-srt-voice-over-editor-so:4b",
+                messages=[prompt],
+                format='json'
+            )
 
-    # 6. Валидация ответа модели
-    edited_json = validate_json(edited_json)
+            # 5. Получение JSON из ответа модели
+            response_content = response.message.content
+            # print(f"DEBUG: RAW response for batch: {response_content[:100]}...")
+            
+            edited_batch = json.loads(response_content)
+
+            # Обработка возможного "одиночного" ответа или обернутого в dict
+            if isinstance(edited_batch, dict):
+                # Если модель вернула один объект вместо списка или обертку
+                if "subtitles" in edited_batch and isinstance(edited_batch["subtitles"], list):
+                     edited_batch = edited_batch["subtitles"]
+                elif "blocks" in edited_batch and isinstance(edited_batch["blocks"], list):
+                     edited_batch = edited_batch["blocks"]
+                else: 
+                     # Пытаемся понять, это один блок или что-то еще
+                     # Если это один блок (есть index), обернем в список
+                     if "index" in edited_batch:
+                         edited_batch = [edited_batch]
+                     else:
+                        print(f"WARN: Непонятная структура ответа батча: {type(edited_batch)}")
+                        # В худшем случае пропускаем или пробуем добавить как есть (упадет на валидации)
+
+            if not isinstance(edited_batch, list):
+                 print(f"WARN: Ответ модели не список, пропускаем батч. Тип: {type(edited_batch)}")
+                 # Можно добавить логику retry, но пока просто пропустим или добавим оригинал?
+                 # Для надежности лучше добавить оригинал, чтобы не сбился тайминг, но пометим ошибку.
+                 print("WARN: Используем оригинальный батч из-за ошибки модели.")
+                 all_edited_blocks.extend(batch)
+                 continue
+
+            # 6. Валидация ответа модели (батча)
+            # Важно: модель может вернуть меньше блоков или испортить индексы. 
+            # Здесь мы пока просто валидируем структуру.
+            validated_batch = validate_json(edited_batch)
+            all_edited_blocks.extend(validated_batch)
+
+        except Exception as e:
+            print(f"ERROR: Ошибка при обработке батча: {e}")
+            print(f"DEBUG: Сырой ответ был: {response.message.content if 'response' in locals() else 'No response'}")
+            # Fallback: добавляем оригинальные блоки, чтобы не ломать файл
+            print("WARN: Используем оригинальный батч из-за ошибки.")
+            all_edited_blocks.extend(batch)
 
     # 7. JSON -> SRT
-    srt_text = json_to_srt(edited_json)
+    print(f"Сборка финального файла из {len(all_edited_blocks)} блоков...")
+    
+    # Дополнительная защита: сортируем по индексу, чтобы порядок был верным
+    # (хотя append должен сохранить порядок)
+    all_edited_blocks.sort(key=lambda x: x['index'])
+
+    srt_text = json_to_srt(all_edited_blocks)
 
     # 8. Сохранение в файл
     with output_srt.open("w", encoding="utf-8") as f:
