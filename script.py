@@ -81,9 +81,16 @@ def process_srt(input_srt: Path, output_srt: Path):
         batch = json_blocks[i : i + BATCH_SIZE]
         print(f"Обработка батча {i // BATCH_SIZE + 1} из {(total_blocks + BATCH_SIZE - 1) // BATCH_SIZE} (блоки {i+1}-{min(i+BATCH_SIZE, total_blocks)})...")
 
+        # Подготовка списка текстов (flattening)
+        # Собираем весь текст блока в одну строку (с переносами, если были), чтобы модель видела контекст фразы целиком
+        batch_texts = []
+        for block in batch:
+            full_text = "\n".join(line["text"] for line in block["lines"])
+            batch_texts.append(full_text)
+
         prompt = {
             "role": "user",
-            "content": json.dumps(batch, ensure_ascii=False)
+            "content": json.dumps(batch_texts, ensure_ascii=False)
         }
 
         try:
@@ -96,52 +103,76 @@ def process_srt(input_srt: Path, output_srt: Path):
 
             # 5. Получение JSON из ответа модели
             response_content = response.message.content
-            # print(f"DEBUG: RAW response for batch: {response_content[:100]}...")
             
-            edited_batch = json.loads(response_content)
+            # 5. Получение JSON из ответа модели
+            response_content = response.message.content
+            
+            try:
+                response_data = json.loads(response_content)
+                
+                # Ожидаем структуру {"lines": ["...", "..."]}
+                if isinstance(response_data, dict) and "lines" in response_data and isinstance(response_data["lines"], list):
+                    edited_texts = response_data["lines"]
+                elif isinstance(response_data, list):
+                    # На случай, если модель все-таки вернет просто список (игнорируя инструкцию, так бывает)
+                    print("INFO: Модель вернула список напрямую, принимаем.")
+                    edited_texts = response_data
+                else:
+                    # Пытаемся найти хоть какой-то список
+                    found_list = None
+                    if isinstance(response_data, dict):
+                        for k, v in response_data.items():
+                            if isinstance(v, list):
+                                found_list = v
+                                print(f"WARN: Найден список по ключу '{k}', используем его.")
+                                break
+                    
+                    if found_list:
+                        edited_texts = found_list
+                    else:
+                        print(f"ERROR: Некорректная структура ответа. Получено: {type(response_data)}")
+                        if isinstance(response_data, dict):
+                            print(f"DEBUG: Ключи: {list(response_data.keys())}")
+                        raise ValueError("Структура ответа не соответствует ожидаемой")
 
-            # Обработка возможного "одиночного" ответа или обернутого в dict
-            if isinstance(edited_batch, dict):
-                # Если модель вернула один объект вместо списка или обертку
-                if "subtitles" in edited_batch and isinstance(edited_batch["subtitles"], list):
-                     edited_batch = edited_batch["subtitles"]
-                elif "blocks" in edited_batch and isinstance(edited_batch["blocks"], list):
-                     edited_batch = edited_batch["blocks"]
-                else: 
-                     # Пытаемся понять, это один блок или что-то еще
-                     # Если это один блок (есть index), обернем в список
-                     if "index" in edited_batch:
-                         edited_batch = [edited_batch]
-                     else:
-                        print(f"WARN: Непонятная структура ответа батча: {type(edited_batch)}")
-                        # В худшем случае пропускаем или пробуем добавить как есть (упадет на валидации)
+            except json.JSONDecodeError:
+                print(f"ERROR: Ошибка парсинга JSON. Сырой ответ: {response_content[:100]}...")
+                all_edited_blocks.extend(batch)
+                continue
+            except Exception as e:
+                print(f"WARN: Ошибка обработки данных ({e}). Используем оригиналы.")
+                all_edited_blocks.extend(batch)
+                continue
+            
+            # Проверка длины (критично!)
+            if len(edited_texts) != len(batch):
+                print(f"WARN: Несовпадение длины! Отправлено {len(batch)}, получено {len(edited_texts)}. Используем оригиналы.")
+                all_edited_blocks.extend(batch)
+                continue
 
-            if not isinstance(edited_batch, list):
-                 print(f"WARN: Ответ модели не список, пропускаем батч. Тип: {type(edited_batch)}")
-                 # Можно добавить логику retry, но пока просто пропустим или добавим оригинал?
-                 # Для надежности лучше добавить оригинал, чтобы не сбился тайминг, но пометим ошибку.
-                 print("WARN: Используем оригинальный батч из-за ошибки модели.")
-                 all_edited_blocks.extend(batch)
-                 continue
-
-            # 6. Валидация ответа модели (батча)
-            # Важно: модель может вернуть меньше блоков или испортить индексы. 
-            # Здесь мы пока просто валидируем структуру.
-            validated_batch = validate_json(edited_batch)
-            all_edited_blocks.extend(validated_batch)
+            # 6. Обновление блоков новыми текстами
+            for block, new_text in zip(batch, edited_texts):
+                # Обновляем текст. Если он пришел строкой, запишем его как одну линию или разобьем?
+                # Для SRT проще оставить как одну линию с \n, srt библиотека разберется (или мы уже разбили в srt_to_json)
+                # srt_to_json разбивает splitlines().
+                # Мы можем просто заменить lines на один элемент с новым текстом (модель могла убрать переносы)
+                if isinstance(new_text, str):
+                    block["lines"] = [{"text": new_text}]
+                else:
+                     # Если вдруг модель вернула не строку (бред, но всё же)
+                     block["lines"] = [{"text": str(new_text)}]
+            
+            all_edited_blocks.extend(batch)
 
         except Exception as e:
             print(f"ERROR: Ошибка при обработке батча: {e}")
-            print(f"DEBUG: Сырой ответ был: {response.message.content if 'response' in locals() else 'No response'}")
-            # Fallback: добавляем оригинальные блоки, чтобы не ломать файл
             print("WARN: Используем оригинальный батч из-за ошибки.")
             all_edited_blocks.extend(batch)
 
     # 7. JSON -> SRT
     print(f"Сборка финального файла из {len(all_edited_blocks)} блоков...")
     
-    # Дополнительная защита: сортируем по индексу, чтобы порядок был верным
-    # (хотя append должен сохранить порядок)
+    # Дополнительная защита: сортируем по индексу
     all_edited_blocks.sort(key=lambda x: x['index'])
 
     srt_text = json_to_srt(all_edited_blocks)
