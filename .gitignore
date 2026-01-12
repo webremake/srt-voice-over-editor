@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+
+# Temporary files
+*.srt
+*.mp3
+*.mp4
+*.wav
+.DS_Store
+
+# Logs
+*.log
