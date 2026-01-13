@@ -17,7 +17,7 @@ if not API_KEY:
     pass
 
 genai.configure(api_key=API_KEY)
-# Используем gemini-3-flash-preview
+# Используем gemini-3-flash-preview для баланса скорости и качества
 MODEL_NAME = "models/gemini-3-flash-preview" 
 model = genai.GenerativeModel(MODEL_NAME)
 
@@ -39,7 +39,19 @@ SYSTEM_PROMPT = """
 # ---------- Основной скрипт ----------
 
 def process_batch(batch_texts):
-    """Отправляет батч в Gemini API и парсит нумерованный ответ."""
+    """
+    Отправляет батч строк в Gemini API и парсит нумерованный ответ.
+
+    Args:
+        batch_texts (list[str]): Список текстовых строк субтитров для редактирования.
+
+    Returns:
+        list[str]: Список отредактированных строк. Пустой список в случае ошибки API или парсинга.
+    
+    Note:
+        Функция ожидает, что модель вернет нумерованный список в формате "1. Текст".
+        Используется регулярное выражение для извлечения текста после номера.
+    """
     prompt_lines = [f"{idx+1}. {text}" for idx, text in enumerate(batch_texts)]
     prompt_text = "\n".join(prompt_lines)
     
@@ -52,7 +64,7 @@ def process_batch(batch_texts):
             
         content = response.text.strip()
         
-        # Парсинг нумерованного списка
+        # Парсинг нумерованного списка из текстового ответа модели
         results = []
         for line in content.split("\n"):
             line = line.strip()
@@ -67,6 +79,24 @@ def process_batch(batch_texts):
         return []
 
 def process_srt(input_srt: Path, output_srt: Path):
+    """
+    Основной цикл обработки SRT файла.
+    
+    Загружает файл, разбивает на батчи по 50 строк, применяет редактирование через Gemini API
+    с использованием двухуровневой логики ретраев (10 строк, затем 5 строк) в случае ошибок.
+
+    Args:
+        input_srt (Path): Путь к входному SRT файлу.
+        output_srt (Path): Путь для сохранения обработанного файла.
+
+    Flow:
+        1. Загрузка через pysrt (сохраняет оригинальные таймкоды).
+        2. Обработка батчами по 50 блоков.
+        3. Если 50 блоков не прошли (несовпадение количества строк) -> ретрай по 10 блоков.
+        4. Если 10 блоков не прошли -> ретрай по 5 блоков.
+        5. Если 5 блоков не прошли -> использование оригинального текста как fallback.
+        6. Пауза 15 секунд между всеми API-запросами для соблюдения лимитов (5 RPM).
+    """
     if not API_KEY:
         print("ERROR: Переменная окружения GEMINI_API_KEY не установлена.")
         return
@@ -94,6 +124,7 @@ def process_srt(input_srt: Path, output_srt: Path):
         batch_res = process_batch(batch_texts)
         
         # 3. Логика RETRY (10 -> 5)
+        # Если количество строк в ответе не совпадает с запросом, начинаем дробление
         if len(batch_res) != len(chunk):
             print(f"  [WARN] Несоответствие: ожидалось {len(chunk)}, получено {len(batch_res)}. Пробуем батчи по 10...")
             
@@ -105,8 +136,7 @@ def process_srt(input_srt: Path, output_srt: Path):
                 sub_ids = f"{i+j+1}-{min(i+j+sub_chunk_size, total_blocks)}"
                 print(f"    Пробуем батч по 10: {sub_ids}...")
                 
-                # Даем паузу перед запрсом в ретрае, если это не самый первый запрос в этой серии
-                # (Хотя после основного батча пауза уже могла быть, но для надежности добавим)
+                # Пауза перед каждым запросом в ретрае для соблюдения Rate Limit
                 time.sleep(15)
                 sub_res = process_batch(sub_texts)
                 
@@ -133,7 +163,7 @@ def process_srt(input_srt: Path, output_srt: Path):
                             print(f"          [RETRY] Попытка {attempt+1} (5 строк) не удалась.")
                             time.sleep(15)
                         
-                        # Если 5 строк не прошли, берем оригинал
+                        # Если 5 строк не прошли даже после ретраев, берем оригинал (fallback)
                         if len(final_res) < len(ssc):
                             while len(final_res) < len(ssc):
                                 final_res.append(ssc_texts[len(final_res)])
@@ -141,20 +171,20 @@ def process_srt(input_srt: Path, output_srt: Path):
                         sub_res.extend(final_res[:len(ssc)])
                 
                 batch_res.extend(sub_res[:len(sub_chunk)])
-            
-        # Записываем результаты
+        
+        # Записываем результаты обратно в объекты pysrt
         for idx, edited_text in enumerate(batch_res):
             if i + idx < total_blocks:
                 subs[i + idx].text = edited_text
         
         i += chunk_size
         
-        # Добавляем задержку для соблюдения лимитов API (5 RPM для Gemini 3 Flash Free Tier)
+        # Добавляем задержку для соблюдения лимитов API (5 RPM для Gemini Free Tier)
         if i < total_blocks:
-            print("Ожидание 15 секунд перед следующим батчем...")
+            print("Ожидание 15 секунд перед следующим основным батчем...")
             time.sleep(15)
 
-    # 4. Сохранение
+    # 4. Сохранение результата
     try:
         subs.save(str(output_srt), encoding='utf-8')
         print(f"Готово! Результат сохранен в {output_srt}")
