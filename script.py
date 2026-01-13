@@ -93,37 +93,52 @@ def process_srt(input_srt: Path, output_srt: Path):
         batch_texts = [sub.text for sub in chunk]
         batch_res = process_batch(batch_texts)
         
-        # 3. Логика RETRY
+        # 3. Логика RETRY (10 -> 5)
         if len(batch_res) != len(chunk):
-            print(f"  [WARN] Несоответствие: ожидалось {len(chunk)}, получено {len(batch_res)}. Уменьшаем батч...")
+            print(f"  [WARN] Несоответствие: ожидалось {len(chunk)}, получено {len(batch_res)}. Пробуем батчи по 10...")
             
-            # Если большой батч (20) не сработал, разбиваем его на мелкие (по 5)
             batch_res = []
-            sub_chunk_size = 5
+            sub_chunk_size = 10
             for j in range(0, len(chunk), sub_chunk_size):
                 sub_chunk = chunk[j:j+sub_chunk_size]
                 sub_texts = [sub.text for sub in sub_chunk]
                 sub_ids = f"{i+j+1}-{min(i+j+sub_chunk_size, total_blocks)}"
-                print(f"    Пробуем под-батч {sub_ids}...")
+                print(f"    Пробуем батч по 10: {sub_ids}...")
                 
-                # До 2 попыток на мелкий батч
-                sub_res = []
-                for attempt in range(2):
-                    sub_res = process_batch(sub_texts)
-                    if len(sub_res) == len(sub_chunk):
-                        # Важно: даже при успехе в ретрае нужно подождать перед следующим под-батчем
-                        if j + sub_chunk_size < len(chunk) or i + chunk_size < total_blocks:
-                            print("Ожидание 15 секунд (retry delay)...")
+                # Даем паузу перед запрсом в ретрае, если это не самый первый запрос в этой серии
+                # (Хотя после основного батча пауза уже могла быть, но для надежности добавим)
+                time.sleep(15)
+                sub_res = process_batch(sub_texts)
+                
+                # Если батч по 10 не прошел, разбиваем его на батчи по 5
+                if len(sub_res) != len(sub_chunk):
+                    print(f"      [WARN] Батч по 10 не прошел. Пробуем батчи по 5 для этого участка...")
+                    sub_res = []
+                    sub_sub_chunk_size = 5
+                    for k in range(0, len(sub_chunk), sub_sub_chunk_size):
+                        ssc = sub_chunk[k:k+sub_sub_chunk_size]
+                        ssc_texts = [sub.text for sub in ssc]
+                        ssc_ids = f"{i+j+k+1}-{min(i+j+k+sub_sub_chunk_size, total_blocks)}"
+                        print(f"        Пробуем батч по 5: {ssc_ids}...")
+                        
+                        # Пауза перед каждым запросом по 5 строк
+                        time.sleep(15)
+                        
+                        # До 2 попыток на батч по 5
+                        final_res = []
+                        for attempt in range(2):
+                            final_res = process_batch(ssc_texts)
+                            if len(final_res) == len(ssc):
+                                break
+                            print(f"          [RETRY] Попытка {attempt+1} (5 строк) не удалась.")
                             time.sleep(15)
-                        break
-                    print(f"      [RETRY] Попытка {attempt+1} не удалась (получено {len(sub_res)}).")
-                    # Если попытка не удалась, тоже ждем перед следующей попыткой
-                    time.sleep(15)
-                
-                # Если все равно не вышло, дополняем оригиналами
-                while len(sub_res) < len(sub_chunk):
-                    idx_to_add = len(sub_res)
-                    sub_res.append(sub_texts[idx_to_add])
+                        
+                        # Если 5 строк не прошли, берем оригинал
+                        if len(final_res) < len(ssc):
+                            while len(final_res) < len(ssc):
+                                final_res.append(ssc_texts[len(final_res)])
+                        
+                        sub_res.extend(final_res[:len(ssc)])
                 
                 batch_res.extend(sub_res[:len(sub_chunk)])
             
