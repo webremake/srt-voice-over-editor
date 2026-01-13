@@ -111,8 +111,14 @@ def process_srt(input_srt: Path, output_srt: Path):
                 for attempt in range(2):
                     sub_res = process_batch(sub_texts)
                     if len(sub_res) == len(sub_chunk):
+                        # Важно: даже при успехе в ретрае нужно подождать перед следующим под-батчем
+                        if j + sub_chunk_size < len(chunk) or i + chunk_size < total_blocks:
+                            print("Ожидание 15 секунд (retry delay)...")
+                            time.sleep(15)
                         break
                     print(f"      [RETRY] Попытка {attempt+1} не удалась (получено {len(sub_res)}).")
+                    # Если попытка не удалась, тоже ждем перед следующей попыткой
+                    time.sleep(15)
                 
                 # Если все равно не вышло, дополняем оригиналами
                 while len(sub_res) < len(sub_chunk):
