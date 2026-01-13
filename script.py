@@ -16,23 +16,23 @@ if not API_KEY:
     pass
 
 genai.configure(api_key=API_KEY)
-# Используем gemma-3-27b-it как одну из самых мощных открытых моделей через API
-MODEL_NAME = "models/gemma-3-27b-it" 
+# Используем gemini-3-flash-preview
+MODEL_NAME = "models/gemini-3-flash-preview" 
 model = genai.GenerativeModel(MODEL_NAME)
 
 SYSTEM_PROMPT = """
-You are a subtitle voice-over editor for educational videos.
+Ты — профессиональный редактор субтитров для образовательных видео.
 
-TASK:
-You will receive a numbered list of subtitle lines.
-Your job is to edit each line to make it concise, clear, and suitable for spoken narration.
+ТВОЯ ЗАДАЧА:
+Ты получишь нумерованный список строк субтитров на РУССКОМ языке.
+Тебе нужно отредактировать каждую строку, чтобы она стала лаконичной, четкой и подходила для озвучки (voice-over).
 
-FORMAT RULES:
-1. Return a numbered list matching the input exactly (e.g., if you get 1-20, return 1-20).
-2. DO NOT merge lines. Each numbered line must stay separate.
-3. DO NOT translate (keep original language).
-4. DO NOT change terminology.
-5. NO CHATTER. Start immediately with "1. [text]".
+ПРАВИЛА:
+1. ВЫХОД СТРОГО НА РУССКОМ ЯЗЫКЕ. Ни в коем случае не переводи на английский.
+2. Сохраняй нумерацию строк (1, 2, 3...). Количество строк на выходе должно в точности совпадать с входом.
+3. НЕ объединяй строки. Каждая строка под своим номером — это отдельный блок.
+4. Убирай лишние слова, вводные конструкции и разговорный мусор ("так сказать", "вот", "ну").
+5. Пиши СТРОГО результат, без лишних вступлений и комментариев.
 """
 
 # ---------- Основной скрипт ----------
