@@ -1,112 +1,139 @@
 import json
+import pysrt
+import re
+import os
+import google.generativeai as genai
 from pathlib import Path
-from pydantic import BaseModel, ValidationError, conint, constr
-from datetime import timedelta
-import srt
-from ollama import Ollama
+from dotenv import load_dotenv
 
-# ---------- Pydantic модели для строгой валидации ----------
-class SubtitleLine(BaseModel):
-    text: constr(min_length=1)  # не пустой текст
+# Загрузка переменных окружения из .env файла
+load_dotenv()
 
-class SubtitleBlock(BaseModel):
-    index: conint(gt=0)
-    start: str  # "00:00:01,000"
-    end: str    # "00:00:05,000"
-    lines: list[SubtitleLine]
+# ---------- Настройка Gemini API ----------
+API_KEY = os.environ.get("GEMINI_API_KEY")
+if not API_KEY:
+    # Если ключа нет в окружении, это будет ошибкой при запуске
+    pass
 
-# ---------- Функции ----------
-def srt_to_json(srt_file: Path) -> list[dict]:
-    """Преобразует SRT в JSON, сохраняя все блоки и переносы строк."""
-    with srt_file.open("r", encoding="utf-8") as f:
-        subtitles = list(srt.parse(f.read()))
-    json_blocks = []
-    for sub in subtitles:
-        json_blocks.append({
-            "index": sub.index,
-            "start": str(sub.start),
-            "end": str(sub.end),
-            "lines": [{"text": line} for line in sub.content.splitlines()]
-        })
-    return json_blocks
+genai.configure(api_key=API_KEY)
+# Используем gemini-3-flash-preview
+MODEL_NAME = "models/gemini-3-flash-preview" 
+model = genai.GenerativeModel(MODEL_NAME)
 
-def json_to_srt(json_blocks: list[dict]) -> str:
-    """Преобразует JSON обратно в SRT."""
-    subs = []
-    for block in json_blocks:
-        content = "\n".join([line["text"] for line in block["lines"]])
-        start = timedelta(
-            hours=block["start"].hour,
-            minutes=block["start"].minute,
-            seconds=block["start"].second,
-            microseconds=block["start"].microsecond
-        ) if isinstance(block["start"], timedelta) else srt.srt_timestamp_to_timedelta(block["start"])
-        end = timedelta(
-            hours=block["end"].hour,
-            minutes=block["end"].minute,
-            seconds=block["end"].second,
-            microseconds=block["end"].microsecond
-        ) if isinstance(block["end"], timedelta) else srt.srt_timestamp_to_timedelta(block["end"])
-        subs.append(srt.Subtitle(index=block["index"], start=start, end=end, content=content))
-    return srt.compose(subs)
+SYSTEM_PROMPT = """
+Ты — профессиональный редактор субтитров для образовательных видео.
 
-def validate_json(json_blocks: list[dict]) -> list[dict]:
-    """Проверка JSON через Pydantic."""
-    validated = []
-    for block in json_blocks:
-        try:
-            b = SubtitleBlock(
-                index=block["index"],
-                start=block["start"],
-                end=block["end"],
-                lines=[SubtitleLine(**line) for line in block["lines"]]
-            )
-            validated.append(b.dict())
-        except ValidationError as e:
-            print(f"Ошибка в блоке {block.get('index')}: {e}")
-    return validated
+ТВОЯ ЗАДАЧА:
+Ты получишь нумерованный список строк субтитров на РУССКОМ языке.
+Тебе нужно отредактировать каждую строку, чтобы она стала лаконичной, четкой и подходила для озвучки (voice-over).
+
+ПРАВИЛА:
+1. ВЫХОД СТРОГО НА РУССКОМ ЯЗЫКЕ. Ни в коем случае не переводи на английский.
+2. Сохраняй нумерацию строк (1, 2, 3...). Количество строк на выходе должно в точности совпадать с входом.
+3. НЕ объединяй строки. Каждая строка под своим номером — это отдельный блок.
+4. Убирай лишние слова, вводные конструкции и разговорный мусор ("так сказать", "вот", "ну").
+5. Пиши СТРОГО результат, без лишних вступлений и комментариев.
+"""
 
 # ---------- Основной скрипт ----------
-def process_srt(input_srt: Path, output_srt: Path):
-    # 1. SRT -> JSON
-    json_blocks = srt_to_json(input_srt)
 
-    # 2. Валидация JSON
-    json_blocks = validate_json(json_blocks)
+def process_batch(batch_texts):
+    """Отправляет батч в Gemini API и парсит нумерованный ответ."""
+    prompt_lines = [f"{idx+1}. {text}" for idx, text in enumerate(batch_texts)]
+    prompt_text = "\n".join(prompt_lines)
+    
+    full_prompt = f"{SYSTEM_PROMPT}\n\nLines to edit:\n{prompt_text}"
 
-    # 3. Подготовка запроса для модели Ollama
-    ollama = Ollama()
-    prompt = {
-        "role": "user",
-        "content": json.dumps(json_blocks, ensure_ascii=False)
-    }
-
-    # 4. Вызов локальной модели
-    response = ollama.chat(
-        model="Gemma3-srt-voice-over-editor:4b",
-        messages=[prompt],
-        temperature=0.7
-    )
-
-    # 5. Получение JSON из ответа модели
     try:
-        edited_json = json.loads(response["content"])
+        response = model.generate_content(full_prompt)
+        if not response or not response.text:
+            return []
+            
+        content = response.text.strip()
+        
+        # Парсинг нумерованного списка
+        results = []
+        for line in content.split("\n"):
+            line = line.strip()
+            # Ищем формат "1. Текст" или "1) Текст"
+            match = re.match(r"^\d+[\.\)]\s*(.*)", line)
+            if match:
+                results.append(match.group(1).strip())
+        
+        return results
     except Exception as e:
-        raise RuntimeError(f"Ошибка разбора JSON из модели: {e}")
+        print(f"  [ERROR] Ошибка Gemini API ({MODEL_NAME}): {e}")
+        return []
 
-    # 6. Валидация ответа модели
-    edited_json = validate_json(edited_json)
+def process_srt(input_srt: Path, output_srt: Path):
+    if not API_KEY:
+        print("ERROR: Переменная окружения GEMINI_API_KEY не установлена.")
+        return
 
-    # 7. JSON -> SRT
-    srt_text = json_to_srt(edited_json)
+    # 1. Загрузка файла через pysrt
+    try:
+        subs = pysrt.open(str(input_srt), encoding='utf-8')
+    except Exception as e:
+        print(f"ERROR: Не удалось открыть файл {input_srt}: {e}")
+        return
 
-    # 8. Сохранение в файл
-    with output_srt.open("w", encoding="utf-8") as f:
-        f.write(srt_text)
+    total_blocks = len(subs)
+    print(f"Всего блоков для обработки: {total_blocks}")
 
-    print(f"Готово! Отредактированные субтитры сохранены в {output_srt}")
+    chunk_size = 20
+    
+    # 2. Обработка батчами
+    i = 0
+    while i < total_blocks:
+        chunk = subs[i:i+chunk_size]
+        batch_ids = f"{i+1}-{min(i+chunk_size, total_blocks)}"
+        print(f"Обработка батча {batch_ids} (размер {len(chunk)})...")
+        
+        batch_texts = [sub.text for sub in chunk]
+        batch_res = process_batch(batch_texts)
+        
+        # 3. Логика RETRY
+        if len(batch_res) != len(chunk):
+            print(f"  [WARN] Несоответствие: ожидалось {len(chunk)}, получено {len(batch_res)}. Уменьшаем батч...")
+            
+            # Если большой батч (20) не сработал, разбиваем его на мелкие (по 5)
+            batch_res = []
+            sub_chunk_size = 5
+            for j in range(0, len(chunk), sub_chunk_size):
+                sub_chunk = chunk[j:j+sub_chunk_size]
+                sub_texts = [sub.text for sub in sub_chunk]
+                sub_ids = f"{i+j+1}-{min(i+j+sub_chunk_size, total_blocks)}"
+                print(f"    Пробуем под-батч {sub_ids}...")
+                
+                # До 2 попыток на мелкий батч
+                sub_res = []
+                for attempt in range(2):
+                    sub_res = process_batch(sub_texts)
+                    if len(sub_res) == len(sub_chunk):
+                        break
+                    print(f"      [RETRY] Попытка {attempt+1} не удалась (получено {len(sub_res)}).")
+                
+                # Если все равно не вышло, дополняем оригиналами
+                while len(sub_res) < len(sub_chunk):
+                    idx_to_add = len(sub_res)
+                    sub_res.append(sub_texts[idx_to_add])
+                
+                batch_res.extend(sub_res[:len(sub_chunk)])
+            
+        # Записываем результаты
+        for idx, edited_text in enumerate(batch_res):
+            if i + idx < total_blocks:
+                subs[i + idx].text = edited_text
+        
+        i += chunk_size
 
-# ---------- Запуск ----------
+    # 4. Сохранение
+    try:
+        subs.save(str(output_srt), encoding='utf-8')
+        print(f"Готово! Результат сохранен в {output_srt}")
+    except Exception as e:
+        print(f"ERROR: Ошибка сохранения: {e}")
+
 if __name__ == "__main__":
     input_file = Path("input.srt")
     output_file = Path("output_voiceover.srt")

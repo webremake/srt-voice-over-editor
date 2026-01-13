@@ -7,11 +7,17 @@ env/
 venv/
 ENV/
 
+# Secrets
+.env
+
 # Temporary files
 *.srt
 *.mp3
 *.mp4
 *.wav
+quality_report.md
+generate_report.py
+list_models.py
 .DS_Store
 
 # Logs
