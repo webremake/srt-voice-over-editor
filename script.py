@@ -81,7 +81,7 @@ def process_srt(input_srt: Path, output_srt: Path):
     total_blocks = len(subs)
     print(f"Всего блоков для обработки: {total_blocks}")
 
-    chunk_size = 20
+    chunk_size = 50
     
     # 2. Обработка батчами
     i = 0
