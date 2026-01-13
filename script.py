@@ -3,6 +3,7 @@ import pysrt
 import re
 import os
 import google.generativeai as genai
+import time
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -126,6 +127,11 @@ def process_srt(input_srt: Path, output_srt: Path):
                 subs[i + idx].text = edited_text
         
         i += chunk_size
+        
+        # Добавляем задержку для соблюдения лимитов API (5 RPM для Gemini 3 Flash Free Tier)
+        if i < total_blocks:
+            print("Ожидание 15 секунд перед следующим батчем...")
+            time.sleep(15)
 
     # 4. Сохранение
     try:
